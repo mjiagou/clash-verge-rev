@@ -1,4 +1,4 @@
-use once_cell::sync::OnceCell;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use tauri::tray::TrayIconBuilder;
 use tauri_plugin_clash_verge_sysinfo::is_current_app_handle_admin;
 use tauri_plugin_mihomo::models::Proxies;
@@ -7,6 +7,7 @@ use tokio::fs;
 pub mod speed_rate;
 use crate::config::{IProfilePreview, IVerge};
 use crate::core::service;
+use crate::core::tray::menu_def::TrayAction;
 use crate::module::lightweight;
 use crate::process::AsyncHandler;
 use crate::singleton;
@@ -18,14 +19,10 @@ use crate::{
 
 use super::handle;
 use anyhow::Result;
-use parking_lot::Mutex;
 use smartstring::alias::String;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
-};
+use std::num::NonZeroU32;
+use std::time::Duration;
 use tauri::{
     AppHandle, Wry,
     menu::{CheckMenuItem, IsMenuItem, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
@@ -38,48 +35,27 @@ use menu_def::{MenuIds, MenuTexts};
 
 type ProxyMenuItem = (Option<Submenu<Wry>>, Vec<Box<dyn IsMenuItem<Wry>>>);
 
+const TRAY_CLICK_DEBOUNCE_MS: u64 = 1_275;
+
 #[derive(Clone)]
 struct TrayState {}
 
-// 托盘点击防抖机制
-static TRAY_CLICK_DEBOUNCE: OnceCell<Mutex<Instant>> = OnceCell::new();
-const TRAY_CLICK_DEBOUNCE_MS: u64 = 300;
-
-fn get_tray_click_debounce() -> &'static Mutex<Instant> {
-    TRAY_CLICK_DEBOUNCE.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(1)))
-}
-
-fn should_handle_tray_click() -> bool {
-    let debounce_lock = get_tray_click_debounce();
-    let now = Instant::now();
-
-    if now.duration_since(*debounce_lock.lock()) >= Duration::from_millis(TRAY_CLICK_DEBOUNCE_MS) {
-        *debounce_lock.lock() = now;
-        true
-    } else {
-        logging!(
-            debug,
-            Type::Tray,
-            "托盘点击被防抖机制忽略，距离上次点击 {}ms",
-            now.duration_since(*debounce_lock.lock()).as_millis()
-        );
-        false
-    }
-}
-
-#[cfg(target_os = "macos")]
 pub struct Tray {
-    last_menu_update: Mutex<Option<Instant>>,
-    menu_updating: AtomicBool,
-}
-
-#[cfg(not(target_os = "macos"))]
-pub struct Tray {
-    last_menu_update: Mutex<Option<Instant>>,
-    menu_updating: AtomicBool,
+    limiter: DefaultDirectRateLimiter,
 }
 
 impl TrayState {
+    async fn get_tray_icon(verge: &IVerge) -> (bool, Vec<u8>) {
+        let system_mode = verge.enable_system_proxy.as_ref().unwrap_or(&false);
+        let tun_mode = verge.enable_tun_mode.as_ref().unwrap_or(&false);
+        match (*system_mode, *tun_mode) {
+            (true, true) => Self::get_tun_tray_icon(verge).await,
+            (true, false) => Self::get_sysproxy_tray_icon(verge).await,
+            (false, true) => Self::get_tun_tray_icon(verge).await,
+            (false, false) => Self::get_common_tray_icon(verge).await,
+        }
+    }
+
     async fn get_common_tray_icon(verge: &IVerge) -> (bool, Vec<u8>) {
         let is_common_tray_icon = verge.common_tray_icon.unwrap_or(false);
         if is_common_tray_icon
@@ -159,10 +135,14 @@ impl TrayState {
 }
 
 impl Default for Tray {
+    #[allow(clippy::unwrap_used)]
     fn default() -> Self {
         Self {
-            last_menu_update: Mutex::new(None),
-            menu_updating: AtomicBool::new(false),
+            limiter: RateLimiter::direct(
+                Quota::with_period(Duration::from_millis(TRAY_CLICK_DEBOUNCE_MS))
+                    .unwrap()
+                    .allow_burst(NonZeroU32::new(1).unwrap()),
+            ),
         }
     }
 }
@@ -207,12 +187,12 @@ impl Tray {
 
         let app_handle = handle::Handle::app_handle();
         let tray_event = { Config::verge().await.latest_arc().tray_event.clone() };
-        let tray_event = tray_event.unwrap_or_else(|| "main_window".into());
+        let tray_event = TrayAction::from(tray_event.as_deref().unwrap_or("main_window"));
         let tray = app_handle
             .tray_by_id("main")
             .ok_or_else(|| anyhow::anyhow!("Failed to get main tray"))?;
-        match tray_event.as_str() {
-            "tray_menu" => tray.set_show_menu_on_left_click(true)?,
+        match tray_event {
+            TrayAction::TrayMenue => tray.set_show_menu_on_left_click(true)?,
             _ => tray.set_show_menu_on_left_click(false)?,
         }
         Ok(())
@@ -224,45 +204,8 @@ impl Tray {
             logging!(debug, Type::Tray, "应用正在退出，跳过托盘菜单更新");
             return Ok(());
         }
-        // 调整最小更新间隔，确保状态及时刷新
-        const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
-
-        // 检查是否正在更新
-        if self.menu_updating.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        // 检查更新频率，但允许重要事件跳过频率限制
-        let should_force_update = match std::thread::current().name() {
-            Some("main") => true,
-            _ => {
-                let last_update = self.last_menu_update.lock();
-                if let Some(last_time) = *last_update {
-                    last_time.elapsed() >= MIN_UPDATE_INTERVAL
-                } else {
-                    true
-                }
-            }
-        };
-
-        if !should_force_update {
-            return Ok(());
-        }
-
         let app_handle = handle::Handle::app_handle();
-
-        // 设置更新状态
-        self.menu_updating.store(true, Ordering::Release);
-
-        let result = self.update_menu_internal(app_handle).await;
-
-        {
-            let mut last_update = self.last_menu_update.lock();
-            *last_update = Some(Instant::now());
-        }
-        self.menu_updating.store(false, Ordering::Release);
-
-        result
+        self.update_menu_internal(app_handle).await
     }
 
     async fn update_menu_internal(&self, app_handle: &AppHandle) -> Result<()> {
@@ -328,15 +271,7 @@ impl Tray {
             }
         };
 
-        let system_mode = verge.enable_system_proxy.as_ref().unwrap_or(&false);
-        let tun_mode = verge.enable_tun_mode.as_ref().unwrap_or(&false);
-
-        let (_is_custom_icon, icon_bytes) = match (*system_mode, *tun_mode) {
-            (true, true) => TrayState::get_tun_tray_icon(verge).await,
-            (true, false) => TrayState::get_sysproxy_tray_icon(verge).await,
-            (false, true) => TrayState::get_tun_tray_icon(verge).await,
-            (false, false) => TrayState::get_common_tray_icon(verge).await,
-        };
+        let (_is_custom_icon, icon_bytes) = TrayState::get_tray_icon(verge).await;
 
         let colorful = verge.tray_icon.clone().unwrap_or_else(|| "monochrome".into());
         let is_colorful = colorful == "colorful";
@@ -363,15 +298,7 @@ impl Tray {
             }
         };
 
-        let system_mode = verge.enable_system_proxy.as_ref().unwrap_or(&false);
-        let tun_mode = verge.enable_tun_mode.as_ref().unwrap_or(&false);
-
-        let (_is_custom_icon, icon_bytes) = match (*system_mode, *tun_mode) {
-            (true, true) => TrayState::get_tun_tray_icon(verge).await,
-            (true, false) => TrayState::get_sysproxy_tray_icon(verge).await,
-            (false, true) => TrayState::get_tun_tray_icon(verge).await,
-            (false, false) => TrayState::get_common_tray_icon(verge).await,
-        };
+        let (_is_custom_icon, icon_bytes) = TrayState::get_tray_icon(verge).await;
 
         let _ = tray.set_icon(Some(tauri::image::Image::from_bytes(&icon_bytes)?));
         Ok(())
@@ -464,25 +391,20 @@ impl Tray {
 
         let verge = Config::verge().await.data_arc();
 
-        // 获取图标
-        let icon_bytes = TrayState::get_common_tray_icon(&verge).await.1;
+        let icon_bytes = TrayState::get_tray_icon(&verge).await.1;
         let icon = tauri::image::Image::from_bytes(&icon_bytes)?;
 
         #[cfg(target_os = "linux")]
         let builder = TrayIconBuilder::with_id("main").icon(icon).icon_as_template(false);
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        let show_menu_on_left_click = {
-            // TODO 优化这里 复用 verge
-            let tray_event = { Config::verge().await.latest_arc().tray_event.clone() };
-            tray_event.is_some_and(|v| v == "tray_menu")
-        };
+        let show_menu_on_left_click = verge.tray_event.as_ref().is_some_and(|v| v == "tray_menu");
 
         #[cfg(not(target_os = "linux"))]
         let mut builder = TrayIconBuilder::with_id("main").icon(icon).icon_as_template(false);
         #[cfg(target_os = "macos")]
         {
-            let is_monochrome = verge.tray_icon.clone().is_none_or(|v| v == "monochrome");
+            let is_monochrome = verge.tray_icon.as_ref().is_none_or(|v| v == "monochrome");
             builder = builder.icon_as_template(is_monochrome);
         }
 
@@ -494,8 +416,10 @@ impl Tray {
         }
 
         let tray = builder.build(app_handle)?;
+        let tray_event = verge.tray_event.clone().unwrap_or_else(|| "main_window".into());
+        let tray_action = TrayAction::from(tray_event.as_str());
 
-        tray.on_tray_icon_event(|_app_handle, event| {
+        tray.on_tray_icon_event(move |_app_handle, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Down,
@@ -503,32 +427,45 @@ impl Tray {
             } = event
             {
                 // 添加防抖检查，防止快速连击
-                if !should_handle_tray_click() {
-                    logging!(info, Type::Tray, "click tray icon too fast, ignore");
+                #[allow(clippy::use_self)]
+                if !Tray::global().should_handle_tray_click() {
                     return;
                 }
-                AsyncHandler::spawn(|| async move {
-                    let tray_event = { Config::verge().await.latest_arc().tray_event.clone() };
-                    let tray_event: String = tray_event.unwrap_or_else(|| "main_window".into());
-                    logging!(debug, Type::Tray, "tray event: {tray_event:?}");
-
-                    match tray_event.as_str() {
-                        "system_proxy" => feat::toggle_system_proxy().await,
-                        "tun_mode" => feat::toggle_tun_mode(None).await,
-                        "main_window" => {
+                logging!(debug, Type::Tray, "tray event: {tray_action:?}");
+                match tray_action {
+                    TrayAction::SystemProxy => {
+                        AsyncHandler::spawn(|| async move {
+                            let _ = feat::toggle_system_proxy().await;
+                        });
+                    }
+                    TrayAction::TunMode => {
+                        AsyncHandler::spawn(|| async move {
+                            let _ = feat::toggle_tun_mode(None).await;
+                        });
+                    }
+                    TrayAction::MainWindow => {
+                        AsyncHandler::spawn(|| async move {
                             if !lightweight::exit_lightweight_mode().await {
                                 WindowManager::show_main_window().await;
                             };
-                        }
-                        _ => {
-                            logging!(warn, Type::Tray, "invalid tray event: {}", tray_event);
-                        }
-                    };
-                });
+                        });
+                    }
+                    _ => {
+                        logging!(warn, Type::Tray, "invalid tray event: {}", tray_event);
+                    }
+                };
             }
         });
         tray.on_menu_event(on_menu_event);
         Ok(())
+    }
+
+    fn should_handle_tray_click(&self) -> bool {
+        let res = self.limiter.check().is_ok();
+        if !res {
+            logging!(debug, Type::Tray, "tray click rate limited");
+        }
+        res
     }
 }
 
@@ -675,7 +612,7 @@ fn create_proxy_menu_item(
     app_handle: &AppHandle,
     show_proxy_groups_inline: bool,
     proxy_submenus: Vec<Submenu<Wry>>,
-    proxies_text: &Arc<str>,
+    proxies_text: &str,
 ) -> Result<ProxyMenuItem> {
     // 创建代理主菜单
     let (proxies_submenu, inline_proxy_items) = if show_proxy_groups_inline {
@@ -1001,10 +938,6 @@ fn on_menu_event(_: &AppHandle, event: MenuEvent) {
             }
             MenuIds::DASHBOARD => {
                 logging!(info, Type::Tray, "托盘菜单点击: 打开窗口");
-
-                if !should_handle_tray_click() {
-                    return;
-                }
                 if !lightweight::exit_lightweight_mode().await {
                     WindowManager::show_main_window().await;
                 };
@@ -1040,9 +973,6 @@ fn on_menu_event(_: &AppHandle, event: MenuEvent) {
             MenuIds::RESTART_CLASH => feat::restart_clash_core().await,
             MenuIds::RESTART_APP => feat::restart_app().await,
             MenuIds::LIGHTWEIGHT_MODE => {
-                if !should_handle_tray_click() {
-                    return;
-                }
                 if !is_in_lightweight_mode() {
                     lightweight::entry_lightweight_mode().await;
                 } else {
