@@ -49,7 +49,7 @@ Supports Windows (x64/x86), Linux (x64/arm64) and macOS 10.15+ (intel/apple).
 
 ## Promotion
 
-### ✈️ [狗狗加速 —— 技术流机场 Doggygo VPN](https://verge.dginv.click/#/register?code=oaxsAGo6)
+### ✈️ [狗狗加速 —— 技术流机场 Doggygo VPN](https://down.dginv.click/#/register?code=gaZMvEpc)
 
 🚀 高性能海外技术流机场，支持免费试用与优惠套餐，全面解锁流媒体及 AI 服务，全球首家采用 **QUIC 协议**。
 
